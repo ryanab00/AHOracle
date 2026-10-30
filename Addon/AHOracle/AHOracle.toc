@@ -1,0 +1,9 @@
+## Interface: 11507
+## Title: AHOracle
+## Notes: Auction House Oracle - crowdsourced AH data collection
+## Author: You
+## Version: 1.0.0
+## SavedVariables: AHOracleDB
+## X-Category: Auction
+
+AHOracle.lua
