@@ -1,0 +1,22 @@
+@mixin faction-glow($color) {
+  box-shadow: 0 0 10px -2px $color;
+  border-color: $color;
+}
+
+@mixin custom-scrollbar {
+  &::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  &::-webkit-scrollbar-track {
+    background: #111827; 
+    border-radius: 4px;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: #374151; 
+    border-radius: 4px;
+  }
+  &::-webkit-scrollbar-thumb:hover {
+    background: #4b5563; 
+  }
+}

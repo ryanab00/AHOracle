@@ -1,0 +1,40 @@
+@import 'variables';
+@import 'mixins';
+
+// Global overrides
+body {
+  background-color: $bg-dark;
+  color: $text-main;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+// Custom utility classes we can use in Vue components
+.faction-horde {
+  background-color: $horde-bg;
+  border-color: $horde-border;
+  color: $horde-red;
+  @include faction-glow($horde-red);
+}
+
+.faction-alliance {
+  background-color: $alliance-bg;
+  border-color: $alliance-border;
+  color: $alliance-blue;
+  @include faction-glow($alliance-blue);
+}
+
+.scrollable-panel {
+  @include custom-scrollbar;
+  overflow-y: auto;
+}
+
+// Page transition animations
+.page-enter-active,
+.page-leave-active {
+  transition: opacity 0.2s ease;
+}
+
+.page-enter-from,
+.page-leave-to {
+  opacity: 0;
+}
