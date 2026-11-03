@@ -1,5 +1,35 @@
-ahoracle-etl/ahoracle.db
-ahoracle-etl/profession_data/.cache
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ── Environment (NEVER commit real .env) ──────────────
+.env
+.env.*
+!.env.example
+
+# ── Databases ─────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Node / Nuxt ───────────────────────────────────────
+node_modules/
+.nuxt/
+.output/
+.nitro/
+.cache/
+.data/
+dist/
+*.log
+
+# ── OS junk ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Repomix / packed snapshots ────────────────────────
 repomix-output.xml
-.venv
-backend/.env

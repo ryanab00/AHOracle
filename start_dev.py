@@ -3,12 +3,13 @@ import sys
 import time
 import os
 
+
 def run_dev():
     print("🚀 Starting AH Oracle Local Development Environment...")
-    
+
     # Define paths
     root_dir = os.path.dirname(os.path.abspath(__file__))
-    backend_dir = os.path.join(root_dir, "backend") 
+    backend_dir = os.path.join(root_dir, "backend")
     frontend_dir = os.path.join(root_dir, "frontend")
 
     processes = []
@@ -22,19 +23,31 @@ def run_dev():
         print("📡 Starting ETL Watcher GUI...")
         watcher_cmd = [sys.executable, "watcher_gui.py"]
         watcher_proc = subprocess.Popen(
-            watcher_cmd, 
-            cwd=backend_dir, 
-            creationflags=CREATE_NEW_CONSOLE
+            watcher_cmd,
+            cwd=backend_dir,
+            creationflags=CREATE_NEW_CONSOLE,
         )
         processes.append(watcher_proc)
 
         # 2. Start FastAPI (Python)
+        #    PYTHONPATH is required so uvicorn's --reload child process on
+        #    Windows can find the `api` package. See docs/DEVELOPMENT.md.
         print("⚙️  Starting FastAPI Backend...")
-        api_cmd = [sys.executable, "-m", "uvicorn", "api.main:app", "--reload", "--port", "8000"]
+        api_env = os.environ.copy()
+        api_env["PYTHONPATH"] = (
+            backend_dir + os.pathsep + api_env.get("PYTHONPATH", "")
+        )
+        api_cmd = [
+            sys.executable, "-m", "uvicorn",
+            "api.main:app",
+            "--reload",
+            "--port", "8000",
+        ]
         api_proc = subprocess.Popen(
-            api_cmd, 
-            cwd=backend_dir, 
-            creationflags=CREATE_NEW_CONSOLE
+            api_cmd,
+            cwd=backend_dir,
+            env=api_env,
+            creationflags=CREATE_NEW_CONSOLE,
         )
         processes.append(api_proc)
 
@@ -42,10 +55,10 @@ def run_dev():
         print("🖥️  Starting Nuxt Frontend...")
         # shell=True is required for npm on Windows
         frontend_proc = subprocess.Popen(
-            "npm run dev", 
-            cwd=frontend_dir, 
+            "npm run dev",
+            cwd=frontend_dir,
             shell=True,
-            creationflags=CREATE_NEW_CONSOLE
+            creationflags=CREATE_NEW_CONSOLE,
         )
         processes.append(frontend_proc)
 
@@ -64,13 +77,14 @@ def run_dev():
             if sys.platform == "win32":
                 # Windows requires killing the process tree to stop npm/uvicorn cleanly
                 subprocess.call(
-                    ['taskkill', '/F', '/T', '/PID', str(p.pid)], 
-                    stdout=subprocess.DEVNULL, 
-                    stderr=subprocess.DEVNULL
+                    ["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
             else:
                 p.terminate()
         print("👋 Goodbye!")
+
 
 if __name__ == "__main__":
     run_dev()
