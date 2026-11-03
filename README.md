@@ -82,6 +82,7 @@ We are moving away from relying on AHDB and building a fully integrated AHOracle
 - **TSM Replacement:** Feature comprehensive accounting, shopping lists, and custom tooltips that pull directly from our up-to-date, community-driven database (rather than TSM's hours-late app data).
 - **Fragmented Scanning:** Passively collect data as users browse the AH, filling gaps between full scans.
 - **Smart Prompts:** If a user is browsing a category with stale data, the addon will prompt them to run a full scan to share with the network.
+- **Tooltips:** Feature purchase disction from ally and horde
 
 ### 2. Dual Scan Modes
 - **Fast Scan:** A quick, names-less snapshot of the entire AH for immediate price updates.

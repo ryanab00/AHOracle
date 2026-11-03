@@ -35,8 +35,10 @@ onMounted(async () => {
       <div class="flex items-center space-x-8">
         <h1 class="text-2xl font-bold">AHOracle</h1>
         <nav class="flex space-x-6 text-sm font-medium">
-          <NuxtLink to="/" class="text-gray-400 hover:text-white transition">Auction House</NuxtLink>
-          <NuxtLink to="/consumables" class="text-gray-400 hover:text-white transition">Consumables</NuxtLink>
+            <NuxtLink to="/" class="text-gray-400 hover:text-white transition">Auction House</NuxtLink>
+  <NuxtLink to="/professions" class="text-gray-400 hover:text-white transition">Professions</NuxtLink>
+  <NuxtLink to="/consumables" class="text-gray-400 hover:text-white transition">Consumables</NuxtLink>
+  <NuxtLink to="/arbitrage" class="text-gray-400 hover:text-white transition">Arbitrage</NuxtLink>
         </nav>
       </div>
       

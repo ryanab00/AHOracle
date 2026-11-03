@@ -1,28 +1,28 @@
 import { defineStore } from 'pinia'
-import { useFactionStore } from './faction'
 import { useToolStore } from './tool'
+import { useFactionStore } from './faction'
 
 export const useAuctionStore = defineStore('auction', {
   state: () => ({
     items: [],
-    loading: false,
-    error: null,
+    total: 0,
+    loading: false
   }),
   actions: {
     async fetchAuctions(page = 1, forceRefresh = false) {
-      const factionStore = useFactionStore()
-      const toolStore = useToolStore()
-      
       this.loading = true
-      this.error = null
-      
-      const url = `http://127.0.0.1:8000/auctions?faction=${factionStore.current}&page=${page}&per_page=50`
+      const toolStore = useToolStore()
+      const factionStore = useFactionStore()
+      const url = `http://127.0.0.1:8000/auctions?page=${page}&faction=${factionStore.current}`
       
       try {
         const data = await toolStore.fetchWithCache(url, forceRefresh)
-        this.items = data.results
+        // The backend returns { items: [...], total: X, ... }
+        this.items = data.items || []
+        this.total = data.total || 0
       } catch (err) {
-        this.error = err.message
+        console.error('Failed to fetch auctions:', err)
+        this.items = []
       } finally {
         this.loading = false
       }
