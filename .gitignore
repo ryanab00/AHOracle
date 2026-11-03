@@ -2,3 +2,4 @@ ahoracle-etl/ahoracle.db
 ahoracle-etl/profession_data/.cache
 repomix-output.xml
 .venv
+backend/.env
