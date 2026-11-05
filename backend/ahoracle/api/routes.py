@@ -1,14 +1,22 @@
-"""Read-only REST API for AH Oracle."""
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, func, text
-from sqlalchemy.orm import Session
-from pathlib import Path
+"""API routes for AH Oracle.
+
+Reads the hand-maintained recipes.json / items.json from ahoracle/api/
+and serves the endpoints consumed by the Nuxt frontend.
+"""
 import json
 import time
+from pathlib import Path
 
-from ahoracle_etl.db import make_engine
-from ahoracle_etl.models import (
-    LiveAuctionBook, DimItem, OHLCVSession, ScanLog,
+from fastapi import APIRouter, Depends
+from sqlalchemy import cast, func, or_, select, text, String
+from sqlalchemy.orm import Session
+
+from ahoracle.db import make_engine
+from ahoracle.models import (
+    DimItem,
+    LiveAuctionBook,
+    OHLCVSession,
+    ScanLog,
 )
 
 router = APIRouter()
@@ -16,54 +24,283 @@ engine = make_engine()
 
 
 def get_db():
-    with Session(engine) as s:
-        yield s
+    with Session(engine) as session:
+        yield session
 
 
-# ─── Static data loaded at import time ───────────────────────────────────
-_API_DIR      = Path(__file__).parent
-RECIPES_FILE  = _API_DIR / "recipes.json"
-ITEMS_FILE    = _API_DIR / "items.json"
+# ─────────────────────────────────────────────────────────────────────────────
+# Data files
+# ─────────────────────────────────────────────────────────────────────────────
+_API_DIR = Path(__file__).parent
+RECIPES_FILE = _API_DIR / "recipes.json"
+ITEMS_FILE = _API_DIR / "items.json"
 
-if not RECIPES_FILE.exists():
-    print(f"WARNING: {RECIPES_FILE.name} not found — /consumables will be empty")
-    RECIPES: list[dict] = []
-else:
+RECIPES: list[dict] = []
+if RECIPES_FILE.exists():
     RECIPES = json.loads(RECIPES_FILE.read_text(encoding="utf-8"))
 
-if not ITEMS_FILE.exists():
-    print(f"WARNING: {ITEMS_FILE.name} not found — item names unavailable")
-    ITEMS_FALLBACK: dict[int, str] = {}
-else:
-    ITEMS_FALLBACK = {
-        int(k): v for k, v in
-        json.loads(ITEMS_FILE.read_text(encoding="utf-8")).items()
-    }
+ITEMS_FALLBACK: dict[int, str] = {}
+if ITEMS_FILE.exists():
+    raw = json.loads(ITEMS_FILE.read_text(encoding="utf-8"))
+    ITEMS_FALLBACK = {int(k): v for k, v in raw.items()}
 
+# Only recipes with at least one reagent can be priced.
 PRICEABLE_RECIPES = [r for r in RECIPES if r.get("reagents")]
-RECIPE_BY_OUTPUT = {r["output_item_id"]: r for r in PRICEABLE_RECIPES}
 
+# Map output_item_id -> recipe. If multiple recipes produce the same item,
+# keep the first (they're sorted by category/name from the extractor).
+RECIPE_BY_OUTPUT: dict[int, dict] = {}
+for _r in PRICEABLE_RECIPES:
+    RECIPE_BY_OUTPUT.setdefault(_r["output_item_id"], _r)
+
+# Vendor prices in copper. Anything vendorable that appears as a reagent
+# MUST be listed here, or the cost calculator will treat it as unavailable.
 VENDOR_ITEMS: dict[int, int] = {
-    3371: 5,     # Crystal Vial
-    8925: 5,     # Crystal Vial
+    3371: 5,      # Crystal Vial (low)
+    3372: 40,     # Leaded Vial
+    8925: 50,     # Crystal Vial (mid)
+    16583: 250,   # Crystal Vial (high)
 }
 
-IMPOSSIBLE = 99999999999
+# The specific raid consumables you want on the /consumables page.
+# This prevents Transmutes, cheap oils, and other junk from cluttering the view.
+RAID_CONSUMES_IDS = {
+    13506, 13510, 13511, 13512, 13513,  # Flasks
+    13457, 13456, 13458, 13459, 13461,  # Greater Prot Pots
+    6049, 6050, 6051, 6052, 7255, 7256, 7257, 7258, 7259, # Regular Prot Pots
+    9172, 13455, 6624,                  # LIP, Gtr Stoneshield, Free Action
+    13447, 13445, 13452, 13454, 21546, 20007, 9187, # Elixirs
+    24801, 22480, 15906,                # Food
+    10646, 18641, 17552, 11451,         # Damage
+    22757, 25129, 25130                 # Weapon Imbues
+}
+
+IMPOSSIBLE = 999_999_999_99
 
 
-# ─── Health & meta ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Market data helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _item_listings_from_db(
+    db: Session, faction: str
+) -> dict[int, list[tuple[int, int]]]:
+    """Returns {item_id: [(unit_price, stack_size), ...] sorted ascending}."""
+    stmt = (
+        select(
+            LiveAuctionBook.item_id,
+            LiveAuctionBook.unit_buyout_price,
+            LiveAuctionBook.stack_size,
+        )
+        .where(LiveAuctionBook.faction == faction)
+        .order_by(LiveAuctionBook.item_id, LiveAuctionBook.unit_buyout_price)
+    )
+    out: dict[int, list[tuple[int, int]]] = {}
+    for item_id, price, size in db.execute(stmt):
+        out.setdefault(item_id, []).append((int(price), int(size)))
+    return out
+
+
+def _seven_day_avg(db: Session, faction: str) -> dict[int, int]:
+    """Average OHLCV avg_price over the last 7 days per item."""
+    cutoff = int(time.time()) - 7 * 86400
+    sql = text(
+        """
+        SELECT item_id, AVG(avg_price) AS avg
+        FROM ohlcv_session
+        WHERE faction = :faction
+          AND bucket_start >= :cutoff
+          AND avg_price IS NOT NULL
+        GROUP BY item_id
+        """
+    )
+    out: dict[int, int] = {}
+    for row in db.execute(sql, {"faction": faction, "cutoff": cutoff}):
+        out[int(row.item_id)] = int(row.avg or 0)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recursive cheapest-source pricing (used for reagents, and by /arbitrage)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_craft_cost(
+    item_id: int,
+    qty: int,
+    item_listings: dict[int, list[tuple[int, int]]],
+    recipe_dict: dict[int, dict],
+    max_depth: int = 12,
+) -> dict:
+    """Cheapest way to obtain `qty` of `item_id` via Vendor / AH / Craft.
+
+    Returns {cost, source, complete, unit_cost, breakdown}.
+    """
+    if qty <= 0:
+        return {"cost": 0, "source": "None", "complete": True,
+                "unit_cost": 0, "breakdown": []}
+
+    cache: dict[tuple[int, int], dict] = {}
+
+    def resolve(iid: int, need: int, path: frozenset[int], depth: int) -> dict:
+        key = (iid, need)
+        if key in cache:
+            return cache[key]
+        if depth > max_depth:
+            return {"cost": IMPOSSIBLE, "source": None, "complete": False,
+                    "unit_cost": 0, "breakdown": []}
+
+        options: list[tuple[str, int, bool, list]] = []
+
+        # ── Vendor ──────────────────────────────────────────────
+        vp = VENDOR_ITEMS.get(iid)
+        if vp is not None:
+            options.append(("Vendor", vp * need, True, []))
+
+        # ── AH order book (walk cheapest listings first) ────────
+        rows = item_listings.get(iid, [])
+        if rows:
+            total, taken = 0, 0
+            for price, size in rows:
+                if taken >= need:
+                    break
+                take = min(size, need - taken)
+                total += price * take
+                taken += take
+            if taken >= need:
+                options.append(("AH", total, True, []))
+
+        # ── Craft (recursively price the reagent tree) ──────────
+        recipe = recipe_dict.get(iid)
+        if recipe and iid not in path:
+            out_q = max(1, int(recipe.get("output_quantity", 1)))
+            crafts_needed = -(-need // out_q)  # ceil(need / out_q)
+            total = 0
+            complete = True
+            breakdown: list[dict] = []
+            new_path = path | {iid}
+            for sub_id_str, base_qty in recipe["reagents"].items():
+                sub_id = int(sub_id_str)
+                sub_need = int(base_qty) * crafts_needed
+                sub = resolve(sub_id, sub_need, new_path, depth + 1)
+                total += sub["cost"]
+                complete = complete and sub["complete"]
+                breakdown.append({
+                    "item_id": sub_id,
+                    "name": ITEMS_FALLBACK.get(sub_id, f"Item #{sub_id}"),
+                    "qty": sub_need,
+                    "cost": sub["cost"],
+                    "source": sub["source"],
+                    "complete": sub["complete"],
+                })
+                if not complete:
+                    break
+            if complete:
+                options.append(("Craft", total, True, breakdown))
+
+        if not options:
+            result = {"cost": IMPOSSIBLE, "source": None, "complete": False,
+                      "unit_cost": 0, "breakdown": []}
+        else:
+            source, cost, complete, breakdown = min(options, key=lambda o: o[1])
+            result = {
+                "cost": cost,
+                "source": source,
+                "complete": complete,
+                "unit_cost": cost // need if need else 0,
+                "breakdown": breakdown,
+            }
+        cache[key] = result
+        return result
+
+    return resolve(item_id, qty, frozenset(), 0)
+
+
+def _price_recipe(recipe: dict, qty: int, item_listings: dict, hist_avg: dict) -> dict:
+    """Helper to price a recipe and shape the response for the frontend."""
+    out_id = int(recipe["output_item_id"])
+    
+    reagent_details = []
+    craft_total = 0
+    craft_complete = True
+    max_crafts = 9999  # Start high, we'll find the bottleneck
+    
+    for sub_id_str, base_qty in recipe["reagents"].items():
+        sub_id = int(sub_id_str)
+        sub_need = int(base_qty) * qty
+        sub = build_craft_cost(sub_id, sub_need, item_listings, RECIPE_BY_OUTPUT)
+        
+        if sub["complete"]:
+            craft_total += sub["cost"]
+        else:
+            craft_complete = False
+            
+        available = sum(s for _, s in item_listings.get(sub_id, []))
+        
+        # Calculate max crafts based on this specific reagent
+        if sub["source"] == "Vendor":
+            possible_crafts = 9999 # Vendor is infinite
+        else:
+            possible_crafts = available // int(base_qty)
+            
+        max_crafts = min(max_crafts, possible_crafts)
+
+        reagent_details.append({
+            "name": ITEMS_FALLBACK.get(sub_id, f"Item #{sub_id}"),
+            "req": sub_need,
+            "current_price": (sub["cost"] // sub_need) if (sub_need and sub["complete"]) else 0,
+            "avg_price": hist_avg.get(sub_id, 0),
+            "available": available,
+            "method": sub["source"] or "?",
+            "complete": sub["complete"],
+        })
+
+    # If a vendor ingredient is the only thing required, cap the max crafts artificially
+    if max_crafts == 9999:
+        max_crafts = 999 
+
+    craft_cost = craft_total if craft_complete else None
+    
+    out_rows = item_listings.get(out_id, [])
+    if out_rows:
+        total_qty = sum(s for _, s in out_rows)
+        total_val = sum(p * s for p, s in out_rows)
+        avg_out = int(total_val / total_qty) if total_qty else 0
+    else:
+        avg_out = 0
+        
+    revenue = avg_out * qty
+    profit = (revenue - (craft_cost or 0)) if craft_complete else 0
+    roi = (profit / craft_cost * 100) if (craft_cost and craft_cost > 0) else 0
+
+    return {
+        "name": recipe["name"],
+        "category": recipe.get("profession", "Other"),
+        "output_item_id": out_id,
+        "quantity": qty,
+        "max_crafts": max_crafts,
+        "total_craft_cost": craft_cost or 0,
+        "total_revenue": revenue,
+        "total_profit": profit,
+        "roi": roi,
+        "insufficient_supply": not craft_complete,
+        "avg_output_price": avg_out,
+        "hist_output_price": hist_avg.get(out_id, avg_out),
+        "reagent_details": reagent_details,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────────────
 @router.get("/health")
 def health_check(db: Session = Depends(get_db)):
     scans = db.scalar(select(func.count()).select_from(ScanLog)) or 0
     items = db.scalar(select(func.count()).select_from(DimItem)) or 0
-    live  = db.scalar(select(func.count()).select_from(LiveAuctionBook)) or 0
+    live = db.scalar(select(func.count()).select_from(LiveAuctionBook)) or 0
     return {
-        "status":          "ok",
-        "scan_rows":       scans,
-        "items":           items,
-        "live_listings":   live,
-        "recipes_loaded":  len(RECIPES),
-        "recipes_priceable": len(PRICEABLE_RECIPES),
+        "scans": scans,
+        "items": items,
+        "live": live,
+        "recipes": len(RECIPES),
+        "priceable_recipes": len(PRICEABLE_RECIPES),
     }
 
 
@@ -73,109 +310,59 @@ def get_last_scan(db: Session = Depends(get_db)):
         select(ScanLog.faction, func.max(ScanLog.scan_timestamp))
         .group_by(ScanLog.faction)
     )
-    rows = db.execute(stmt).all()
-    return {faction: ts for faction, ts in rows}
+    out = {"Horde": 0, "Alliance": 0, "Neutral": 0}
+    for faction, ts in db.execute(stmt):
+        if faction in out:
+            out[faction] = int(ts or 0)
+    return out
 
 
-# ─── Auction browser ─────────────────────────────────────────────────────
 @router.get("/auctions")
-def list_auctions(
-    page:     int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=500),
-    faction:  str = Query("Horde"),
+def get_auctions(
+    faction: str = "Horde",
+    page: int = 1,
+    per_page: int = 200,
+    q: str = "",
     db: Session = Depends(get_db),
 ):
-    stmt = text("""
-        SELECT item_id, item_name,
-               COUNT(*)                  AS num_listings,
-               SUM(stack_size)           AS total_quantity,
-               MIN(unit_buyout_price)    AS min_price,
-               MAX(unit_buyout_price)    AS max_price
-        FROM live_auction_book
-        WHERE faction = :faction
-        GROUP BY item_id, item_name
-        ORDER BY item_name
-        LIMIT :limit OFFSET :offset
-    """)
-    count_stmt = text(
-        "SELECT COUNT(DISTINCT item_id) FROM live_auction_book WHERE faction = :faction"
-    )
-    total = db.execute(count_stmt, {"faction": faction}).scalar() or 0
-    rows = db.execute(stmt, {
-        "faction": faction,
-        "limit":   per_page,
-        "offset":  (page - 1) * per_page,
-    }).all()
+    base = select(
+        LiveAuctionBook.item_id,
+        func.min(LiveAuctionBook.item_name).label("item_name"),
+        func.count().label("num_listings"),
+        func.sum(LiveAuctionBook.stack_size).label("total_quantity"),
+        func.min(LiveAuctionBook.unit_buyout_price).label("min_price"),
+        func.max(LiveAuctionBook.unit_buyout_price).label("max_price"),
+    ).where(LiveAuctionBook.faction == faction)
 
-    items = [
-        {
-            "item_id":        r[0],
-            "item_name":      r[1],
-            "num_listings":   r[2],
-            "total_quantity": r[3],
-            "min_price":      r[4],
-            "max_price":      r[5],
-        }
-        for r in rows
-    ]
-    return {
-        "items":    items,
-        "page":     page,
-        "per_page": per_page,
-        "total":    total,
-    }
-
-
-@router.get("/auctions/{item_id}")
-def auction_listings(
-    item_id: int,
-    faction: str = Query("Horde"),
-    db: Session = Depends(get_db),
-):
-    stmt = (
-        select(LiveAuctionBook)
-        .where(
-            LiveAuctionBook.item_id == item_id,
-            LiveAuctionBook.faction == faction,
+    if q:
+        q_like = f"%{q}%"
+        base = base.where(
+            or_(
+                LiveAuctionBook.item_name.ilike(q_like),
+                cast(LiveAuctionBook.item_id, String).like(q_like),
+            )
         )
-        .order_by(LiveAuctionBook.unit_buyout_price.asc())
-        .limit(200)
-    )
-    return list(db.scalars(stmt))
 
+    base = base.group_by(LiveAuctionBook.item_id)
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    rows = db.execute(
+        base.order_by(func.count().desc())
+        .limit(per_page)
+        .offset(max(0, page - 1) * per_page)
+    ).all()
 
-# ─── Item detail ─────────────────────────────────────────────────────────
-@router.get("/items/{item_id}/stats")
-def item_stats(
-    item_id: int,
-    faction: str = Query("Horde"),
-    db: Session = Depends(get_db),
-):
-    item = db.get(DimItem, item_id)
-
-    # UPDATED: Query the new summary table instead of the old view
-    vol_stmt = text("""
-        SELECT price, SUM(units_vanished) as units_vanished, SUM(events) as events
-        FROM volume_summary_daily
-        WHERE item_id = :item_id AND faction = :faction
-        GROUP BY price
-        ORDER BY price
-    """)
-    vol_rows = db.execute(vol_stmt, {
-        "item_id": item_id, "faction": faction,
-    }).all()
-
-    volume_at_price = [
-        {"price": r[0], "units_vanished": r[1], "events": r[2]}
-        for r in vol_rows
-    ]
-    return {
-        "item": {
-            "item_id":   item_id,
-            "item_name": item.item_name if item else None,
-        },
-        "volume_at_price": volume_at_price,
-    }
+    items = []
+    for r in rows:
+        items.append({
+            "item_id": int(r.item_id),
+            "item_name": r.item_name
+                        or ITEMS_FALLBACK.get(int(r.item_id), f"Item #{r.item_id}"),
+            "num_listings": int(r.num_listings),
+            "total_quantity": int(r.total_quantity or 0),
+            "min_price": int(r.min_price or 0),
+            "max_price": int(r.max_price or 0),
+        })
+    return {"page": page, "per_page": per_page, "total": total, "items": items}
 
 
 @router.get("/items/{item_id}/history")
@@ -183,7 +370,7 @@ def item_history(item_id: int, db: Session = Depends(get_db)):
     stmt = (
         select(OHLCVSession)
         .where(OHLCVSession.item_id == item_id)
-        .order_by(OHLCVSession.bucket_start.asc())
+        .order_by(OHLCVSession.bucket_start)
     )
     history = list(db.scalars(stmt))
 
@@ -191,371 +378,152 @@ def item_history(item_id: int, db: Session = Depends(get_db)):
     for h in history:
         t = h.bucket_start * 1000
         bucket = time_map.setdefault(t, {"time": t})
-        key = (
-            "Horde"    if h.faction == "Horde"    else
-            "Alliance" if h.faction == "Alliance" else
-            "Neutral"
-        )
-        bucket[f"{key}Price"]   = h.close_price
-        bucket[f"{key}Median"]  = h.median_price
-        bucket[f"{key}Average"] = h.avg_price
-        bucket[f"{key}Volume"]  = h.volume
+        bucket[f"{h.faction}Price"] = h.avg_price
+        bucket[f"{h.faction}Volume"] = h.volume
 
-    return sorted(time_map.values(), key=lambda x: x["time"])
+    listing_stmt = (
+        select(LiveAuctionBook)
+        .where(LiveAuctionBook.item_id == item_id)
+        .order_by(LiveAuctionBook.unit_buyout_price, LiveAuctionBook.stack_size)
+    )
+    listings = list(db.scalars(listing_stmt))
 
+    depth_by_faction: dict[str, list[dict]] = {}
+    for row in listings:
+        bucket = depth_by_faction.setdefault(row.faction, [])
+        bucket.append({"price": row.unit_buyout_price,
+                       "stack_size": row.stack_size})
+    for bucket in depth_by_faction.values():
+        cumulative = 0
+        for entry in bucket:
+            cumulative += entry["stack_size"]
+            entry["cumulative_units"] = cumulative
 
-@router.get("/items/{item_id}/current_depth")
-def item_current_depth(
-    item_id: int,
-    faction: str = Query("Horde"),
-    db: Session = Depends(get_db),
-):
-    stmt = text("""
-        SELECT unit_buyout_price, stack_size
-        FROM live_auction_book
-        WHERE item_id = :item_id AND faction = :faction
-        ORDER BY unit_buyout_price ASC
-    """)
-    rows = db.execute(stmt, {
-        "item_id": item_id, "faction": faction,
-    }).all()
-
-    cumulative_units = 0
-    depth_data = []
-    for price, stack in rows:
-        cumulative_units += stack
-        depth_data.append({
-            "price":            price,
-            "cumulative_units": cumulative_units,
-        })
-    return depth_data
-
-
-# ─── Crafting profitability ──────────────────────────────────────────────
-def cheapest_cost(
-    item_id: int,
-    qty: int,
-    item_listings: dict[int, list[tuple[int, int]]],
-    recipe_dict: dict[int, dict],
-    vendor_items: dict[int, int],
-    depth: int = 0,
-) -> int:
-    if qty <= 0: return 0
-    if depth > 12: return IMPOSSIBLE
-
-    # 1. AH
-    ah_cost, acquired = 0, 0
-    for price, stack in item_listings.get(item_id, []):
-        if acquired >= qty: break
-        buy = min(stack, qty - acquired)
-        ah_cost   += price * buy
-        acquired  += buy
-    ah_complete = acquired >= qty
-
-    # 2. Vendor
-    vendor_price = vendor_items.get(item_id)
-    vendor_cost  = vendor_price * qty if vendor_price is not None else IMPOSSIBLE
-
-    # 3. Crafting
-    craft_cost = IMPOSSIBLE
-    if item_id in recipe_dict:
-        r = recipe_dict[item_id]
-        total = 0
-        ok = True
-        for sub_id_str, sub_qty in r["reagents"].items():
-            sub_id = int(sub_id_str)
-            sub = cheapest_cost(
-                sub_id, sub_qty * qty,
-                item_listings, recipe_dict, vendor_items, depth + 1,
-            )
-            if sub >= IMPOSSIBLE:
-                ok = False
-                break
-            total += sub
-        if ok:
-            craft_cost = total
-
-    if ah_complete and ah_cost < vendor_cost and ah_cost < craft_cost:
-        return ah_cost
-    if vendor_cost < craft_cost:
-        return vendor_cost if vendor_cost < IMPOSSIBLE else IMPOSSIBLE
-    return craft_cost
-
-
-def price_recipe(
-    recipe: dict,
-    quantity: int,
-    faction: str,
-    item_listings: dict[int, list[tuple[int, int]]],
-    hist_avg: dict[int, int],
-    item_lookup: dict[int, str],
-) -> dict:
-    output_id = recipe["output_item_id"]
-    output_rows = item_listings.get(output_id, [])
-
-    if output_rows:
-        total_qty = sum(s for _, s in output_rows)
-        total_val = sum(p * s for p, s in output_rows)
-        avg_out = int(total_val / total_qty) if total_qty else 0
-    else:
-        avg_out = 0
-    revenue = avg_out * quantity
-    hist_out = hist_avg.get(output_id, avg_out)
-
-    total_cost = 0
-    reagent_details = []
-    insufficient = False
-    missing = None
-
-    for reagent_id_str, base_qty in recipe["reagents"].items():
-        reagent_id = int(reagent_id_str)
-        req = base_qty * quantity
-
-        ah_only = cheapest_cost(reagent_id, req, item_listings, {}, {})
-        vendor_only = (
-            VENDOR_ITEMS[reagent_id] * req
-            if reagent_id in VENDOR_ITEMS else IMPOSSIBLE
-        )
-        all_in = cheapest_cost(
-            reagent_id, req, item_listings, RECIPE_BY_OUTPUT, VENDOR_ITEMS,
-        )
-
-        if all_in >= IMPOSSIBLE:
-            insufficient = True
-            missing = f"{req}x {item_lookup.get(reagent_id, f'Item #{reagent_id}')}"
-            break
-
-        if all_in < min(ah_only, vendor_only):
-            method = "Craft"
-        elif vendor_only < ah_only:
-            method = "Vendor"
-        else:
-            method = "AH"
-
-        unit_cost = all_in // req if req else all_in
-        available = sum(s for _, s in item_listings.get(reagent_id, []))
-        reagent_details.append({
-            "name":          item_lookup.get(reagent_id, f"Item #{reagent_id}"),
-            "item_id":       reagent_id,
-            "req":           req,
-            "current_price": unit_cost,
-            "avg_price":     hist_avg.get(reagent_id, unit_cost),
-            "available":     available,
-            "method":        method,
-        })
-        total_cost += all_in
-
-    profit = None
-    roi    = 0.0
-    if not insufficient:
-        profit = revenue - total_cost
-        roi    = (profit / total_cost * 100) if total_cost > 0 else 0.0
-
+    item = db.get(DimItem, item_id)
     return {
-        "faction":            faction,
-        "quantity":           quantity,
-        "total_craft_cost":   total_cost,
-        "total_revenue":      revenue,
-        "total_profit":       profit,
-        "roi":                roi,
-        "insufficient_supply": insufficient,
-        "missing_reagent":    missing,
-        "reagent_details":    reagent_details,
-        "hist_output_price":  hist_out,
+        "item": {
+            "item_id": item_id,
+            "item_name": (item.item_name if item and item.item_name else None)
+                         or ITEMS_FALLBACK.get(item_id, f"Item #{item_id}"),
+        },
+        "history": list(time_map.values()),
+        "depth": depth_by_faction,
+        "listings": [
+            {
+                "faction": l.faction,
+                "seller": l.seller,
+                "stack_size": l.stack_size,
+                "unit_buyout_price": l.unit_buyout_price,
+                "duration_hours": l.duration_hours,
+            }
+            for l in listings
+        ],
     }
 
 
 @router.get("/consumables")
-def consumables(
-    quantity: int = Query(1, ge=1, le=1000),
-    faction:  str = Query("Horde"),
-    include_unpriceable: bool = Query(False),
+def get_consumables(
+    quantity: int = 1,
+    faction: str = "Horde",
     db: Session = Depends(get_db),
 ):
-    item_lookup: dict[int, str] = dict(ITEMS_FALLBACK)
-    for row in db.execute(text(
-        "SELECT item_id, item_name FROM dim_items"
-    )).all():
-        if row[1]:
-            item_lookup[row[0]] = row[1]
+    item_listings = _item_listings_from_db(db, faction)
+    hist_avg = _seven_day_avg(db, faction)
+    qty = max(1, quantity)
 
-    faction_cache = {}
-    for side in ("Horde", "Alliance"):
-        faction_cache[side] = _load_faction(side, db)
-
-    results = []
+    out = []
     for recipe in RECIPES:
-        output_id = recipe["output_item_id"]
-        output_name = item_lookup.get(output_id, f"Item #{output_id}")
-
-        recipe_name = recipe["name"]
-        if recipe_name.startswith("Item #"):
-            recipe_name = output_name
-
-        if not recipe.get("reagents"):
-            if include_unpriceable:
-                results.append({
-                    "name":             recipe_name,
-                    "category":         recipe.get("category", "Other"),
-                    "output_item_name": output_name,
-                    "output_item_id":   output_id,
-                    "unpriceable":      True,
-                    "horde":            None,
-                    "alliance":         None,
-                })
+        out_id = int(recipe["output_item_id"])
+        if out_id not in RAID_CONSUMES_IDS:
             continue
+        out.append(_price_recipe(recipe, qty, item_listings, hist_avg))
 
-        result_for_side = {}
-        for side in ("Horde", "Alliance"):
-            listings, avg = faction_cache[side]
-            result_for_side[side] = price_recipe(
-                recipe, quantity, side, listings, avg, item_lookup,
-            )
-
-        results.append({
-            "name":             recipe_name,
-            "category":         recipe.get("category", "Other"),
-            "output_item_name": output_name,
-            "output_item_id":   output_id,
-            "unpriceable":      False,
-            "quantity":         quantity,
-            "horde":            result_for_side["Horde"],
-            "alliance":         result_for_side["Alliance"],
-        })
-
-    return results # <--- THIS WAS MISSING
+    return out
 
 
-# ─── Helper: on-demand per-faction listing load ──────────────────────────
-def _load_faction(faction: str, db: Session):
-    listings: dict[int, list[tuple[int, int]]] = {}
-    for item_id, price, stack in db.execute(text("""
-        SELECT item_id, unit_buyout_price, stack_size
-        FROM live_auction_book
-        WHERE faction = :faction
-        ORDER BY item_id, unit_buyout_price
-    """), {"faction": faction}).all():
-        listings.setdefault(item_id, []).append((price, stack))
+@router.get("/professions")
+def get_professions(
+    quantity: int = 1,
+    faction: str = "Horde",
+    db: Session = Depends(get_db),
+):
+    item_listings = _item_listings_from_db(db, faction)
+    hist_avg = _seven_day_avg(db, faction)
+    qty = max(1, quantity)
 
-    cutoff = int(time.time()) - (7 * 86400)
-    rows = db.execute(text("""
-        SELECT item_id,
-               SUM(close_price * volume),
-               SUM(volume)
-        FROM ohlcv_session
-        WHERE bucket_start > :cutoff AND faction = :faction
-        GROUP BY item_id
-    """), {"cutoff": cutoff, "faction": faction}).all()
-    avg = {r[0]: int(r[1] / r[2]) for r in rows if r[2] and r[2] > 0}
-    return listings, avg
+    out = []
+    for recipe in RECIPES:
+        out.append(_price_recipe(recipe, qty, item_listings, hist_avg))
+
+    return out
 
 
-# ─── Arbitrage ───────────────────────────────────────────────────────────
 @router.get("/arbitrage")
 def get_arbitrage(
-    direction: str = Query("ally_to_horde"),
+    direction: str = "ally_to_horde",
     db: Session = Depends(get_db),
 ):
-    hist_stmt = text("""
-        SELECT item_id, faction, median_price 
-        FROM ohlcv_session 
-        WHERE bucket_start >= (EXTRACT(EPOCH FROM NOW()) - 604800)::bigint
-    """)
-    medians = {(r[0], r[1]): r[2] for r in db.execute(hist_stmt).all() if r[2]}
+    src_faction = "Alliance" if direction == "ally_to_horde" else "Horde"
+    dst_faction = "Horde" if direction == "ally_to_horde" else "Alliance"
 
-    live_stmt = text("""
-        SELECT item_id, item_name, faction, unit_buyout_price, stack_size
-        FROM live_auction_book
-        ORDER BY item_id, faction, unit_buyout_price ASC
-    """)
-    rows = db.execute(live_stmt).all()
+    src_listings = _item_listings_from_db(db, src_faction)
+    dst_listings = _item_listings_from_db(db, dst_faction)
 
-    book = {}
-    for r in rows:
-        key = (r.item_id, r.faction)
-        if key not in book: book[key] = {"name": r.item_name, "listings": []}
-        book[key]["listings"].append({"price": r.unit_buyout_price, "qty": r.stack_size})
+    out = []
+    for recipe in RECIPES:
+        out_id = int(recipe["output_item_id"])
 
-    def get_craft_cost(reagents, faction):
-        total_cost = 0
-        breakdown = []
-        for rid_str, req_qty in reagents.items():
-            rid = int(rid_str)
-            listings = book.get((rid, faction), [])
-            cost, acquired = 0, 0
-            for listing in listings:
-                if acquired >= req_qty: break
-                buy = min(listing["qty"], req_qty - acquired)
-                cost += buy * listing["price"]
-                acquired += buy
-            if acquired < req_qty: return None, [] 
-            total_cost += cost
-            breakdown.append({"item_id": rid, "qty": req_qty, "cost": cost})
-        return total_cost, breakdown
+        src_rows = src_listings.get(out_id, [])
+        dst_rows = dst_listings.get(out_id, [])
+        if not src_rows or not dst_rows:
+            continue
 
-    opportunities = []
-    all_items = set(k[0] for k in book.keys())
+        # Direct flip: cheapest buy on source, undercut cheapest on dest.
+        buy_price = src_rows[0][0]
+        sell_price = max(1, dst_rows[0][0] - 1)
+        qty_available = sum(s for _, s in src_rows)
 
-    for item_id in all_items:
-        horde_listings = book.get((item_id, "Horde"), {}).get("listings", [])
-        ally_listings = book.get((item_id, "Alliance"), {}).get("listings", [])
-        
-        if not horde_listings or not ally_listings: continue
+        profit_per = sell_price - buy_price
+        if profit_per <= 0:
+            continue
 
-        item_name = book.get((item_id, "Horde"), book.get((item_id, "Alliance"))).get("name")
+        total_profit = profit_per * qty_available
+        roi = (profit_per / buy_price * 100) if buy_price else 0
 
-        if direction == "ally_to_horde":
-            source, dest, dest_faction = ally_listings, horde_listings, "Horde"
-        else:
-            source, dest, dest_faction = horde_listings, ally_listings, "Alliance"
+        # Crafting comparison (informational)
+        src_craft = build_craft_cost(out_id, 1, src_listings, RECIPE_BY_OUTPUT)
+        dst_craft = build_craft_cost(out_id, 1, dst_listings, RECIPE_BY_OUTPUT)
 
-        buy_price = source[0]["price"]
-        total_available = sum(l["qty"] for l in source)
+        craft_data = None
+        if src_craft["complete"] or dst_craft["complete"]:
+            reagents = []
+            for entry in src_craft.get("breakdown", []):
+                sub_id = entry["item_id"]
+                sub_qty = entry["qty"]
+                s_src = build_craft_cost(sub_id, sub_qty, src_listings, RECIPE_BY_OUTPUT)
+                s_dst = build_craft_cost(sub_id, sub_qty, dst_listings, RECIPE_BY_OUTPUT)
+                reagents.append({
+                    "name": entry["name"],
+                    "qty": sub_qty,
+                    "ally_cost": (s_src["cost"] if direction == "ally_to_horde" else s_dst["cost"]) if (s_src["complete"] or s_dst["complete"]) else 0,
+                    "horde_cost": (s_dst["cost"] if direction == "ally_to_horde" else s_src["cost"]) if (s_src["complete"] or s_dst["complete"]) else 0,
+                })
+            craft_data = {
+                "ally_cost": (src_craft["cost"] if direction == "ally_to_horde" else dst_craft["cost"]) if (src_craft["complete"] or dst_craft["complete"]) else 0,
+                "horde_cost": (dst_craft["cost"] if direction == "ally_to_horde" else src_craft["cost"]) if (src_craft["complete"] or dst_craft["complete"]) else 0,
+                "reagents": reagents,
+            }
 
-        current_cheapest_dest = dest[0]["price"]
-        median_dest = medians.get((item_id, dest_faction), current_cheapest_dest)
-        
-        if current_cheapest_dest > (median_dest * 5):
-            realistic_sell_price = median_dest
-        else:
-            realistic_sell_price = min(current_cheapest_dest, median_dest)
+        out.append({
+            "item_id": out_id,
+            "item_name": ITEMS_FALLBACK.get(out_id, f"Item #{out_id}"),
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "qty_available": qty_available,
+            "roi": roi,
+            "total_profit": total_profit,
+            "craft_data": craft_data,
+        })
 
-        if (item_id, dest_faction) not in medians:
-            realistic_sell_price = min(realistic_sell_price, int(buy_price * 3))
-
-        profit_per_unit = int((realistic_sell_price * 0.95) - buy_price)
-
-        if profit_per_unit > 0:
-            craft_data = None
-            if item_id in RECIPE_BY_OUTPUT:
-                recipe = RECIPE_BY_OUTPUT[item_id]
-                ally_cost, ally_mats = get_craft_cost(recipe["reagents"], "Alliance")
-                horde_cost, horde_mats = get_craft_cost(recipe["reagents"], "Horde")
-                
-                craft_data = {
-                    "ally_cost": ally_cost or 0,
-                    "horde_cost": horde_cost or 0,
-                    "reagents": [
-                        {
-                            "name": next((n for i, n in ITEMS_FALLBACK.items() if i == int(rid)), f"Item #{rid}"),
-                            "qty": req_qty,
-                            "ally_cost": next((m["cost"] for m in ally_mats if m["item_id"] == int(rid)), 0),
-                            "horde_cost": next((m["cost"] for m in horde_mats if m["item_id"] == int(rid)), 0)
-                        } for rid, req_qty in recipe["reagents"].items()
-                    ]
-                }
-
-            opportunities.append({
-                "item_id": item_id,
-                "item_name": item_name,
-                "buy_price": buy_price,
-                "sell_price": realistic_sell_price,
-                "profit_per_unit": profit_per_unit,
-                "total_profit": profit_per_unit * total_available,
-                "qty_available": total_available,
-                "roi": (profit_per_unit / buy_price) * 100,
-                "craft_data": craft_data
-            })
-
-    opportunities.sort(key=lambda x: x["roi"], reverse=True)
-    return opportunities[:100]
+    out.sort(key=lambda x: x["total_profit"], reverse=True)
+    return out

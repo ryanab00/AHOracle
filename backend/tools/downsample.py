@@ -4,7 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import time
 from sqlalchemy import text
-from ahoracle_etl.db import make_engine
+from ahoracle.db import make_engine
 
 def downsample():
     engine = make_engine()

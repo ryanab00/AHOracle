@@ -22,9 +22,9 @@ from pathlib import Path
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from ahoracle_etl import parse, pipeline
-from ahoracle_etl.db import make_engine, ensure_views, default_db_url
-from ahoracle_etl.models import (
+from ahoracle import parse, pipeline
+from ahoracle.db import make_engine, ensure_views, default_db_url
+from ahoracle.models import (
     AuctionEventLog, Base, DimItem, LiveAuctionBook, OHLCVSession, ScanLog,
 )
 

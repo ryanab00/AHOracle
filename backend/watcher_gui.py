@@ -7,8 +7,8 @@ from pathlib import Path
 from datetime import datetime
 import json
 
-from ahoracle_etl import parse, pipeline
-from ahoracle_etl.db import make_engine
+from ahoracle import parse, pipeline
+from ahoracle.db import make_engine
 from sqlalchemy.orm import Session
 
 VERSION = "0.3.2"

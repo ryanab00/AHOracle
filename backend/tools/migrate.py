@@ -5,8 +5,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from ahoracle_etl.db import make_engine
-from ahoracle_etl.models import (
+from ahoracle.db import make_engine
+from ahoracle.models import (
     Base, DimItem, ScanLog, LiveAuctionBook,
     ScanSnapshot, AuctionEventLog, OHLCVSession
 )

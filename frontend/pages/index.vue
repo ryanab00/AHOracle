@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch, onMounted } from 'vue'
+import { ref, watch, onMounted, computed } from 'vue'
 import { useFactionStore } from '~/stores/faction'
 import { useAuctionStore } from '~/stores/auction'
 import { useToolStore } from '~/stores/tool'
@@ -7,14 +7,26 @@ import { useToolStore } from '~/stores/tool'
 const factionStore = useFactionStore()
 const auctionStore = useAuctionStore()
 const toolStore = useToolStore()
-const page = ref(1)
 
-onMounted(() => {
-  auctionStore.fetchAuctions(page.value)
+const page = ref(1)
+const search = ref('')
+let debounceTimer = null
+
+// Fetch with server-side search when text changes
+watch(search, (newVal) => {
+  clearTimeout(debounceTimer)
+  debounceTimer = setTimeout(() => {
+    page.value = 1
+    auctionStore.fetchAuctions(page.value, newVal)
+  }, 300)
 })
 
 watch([page, () => factionStore.current], () => {
-  auctionStore.fetchAuctions(page.value)
+  auctionStore.fetchAuctions(page.value, search.value)
+})
+
+onMounted(() => {
+  auctionStore.fetchAuctions(page.value, search.value)
 })
 </script>
 
@@ -22,15 +34,30 @@ watch([page, () => factionStore.current], () => {
   <main class="p-8">
     <div class="max-w-6xl mx-auto">
       <div class="bg-gray-800 rounded-lg shadow-lg overflow-hidden">
-        <div class="p-4 border-b border-gray-700 flex justify-between items-center">
+        
+        <!-- Header with Title, Search, and Pagination -->
+        <div class="p-4 border-b border-gray-700 flex flex-wrap justify-between items-center gap-4">
           <h2 class="text-xl">{{ factionStore.current }} Auction House</h2>
-          <div class="space-x-2 flex items-center">
-            <button :disabled="page === 1" @click="page--" class="px-4 py-2 bg-gray-700 rounded disabled:opacity-50 hover:bg-gray-600 transition">Prev</button>
-            <span class="px-4 py-2">Page {{ page }}</span>
-            <button @click="page++" class="px-4 py-2 bg-gray-700 rounded hover:bg-gray-600 transition">Next</button>
+          
+          <div class="flex items-center gap-4">
+            <!-- Search Bar -->
+            <input 
+              v-model="search"
+              type="text" 
+              placeholder="Search name or ID..." 
+              class="bg-gray-900 text-white px-3 py-1.5 rounded border border-gray-600 text-sm w-64 focus:outline-none focus:border-blue-500" 
+            />
+            
+            <!-- Pagination -->
+            <div class="space-x-2 flex items-center">
+              <button :disabled="page === 1" @click="page--" class="px-4 py-2 bg-gray-700 rounded disabled:opacity-50 hover:bg-gray-600 transition">Prev</button>
+              <span class="px-4 py-2">Page {{ page }}</span>
+              <button @click="page++" class="px-4 py-2 bg-gray-700 rounded hover:bg-gray-600 transition">Next</button>
+            </div>
           </div>
         </div>
 
+        <!-- Data Table -->
         <div v-if="auctionStore.loading" class="p-8 text-center text-gray-400">Loading summary...</div>
         
         <table v-else-if="auctionStore.items.length > 0" class="w-full text-left">
@@ -57,6 +84,11 @@ watch([page, () => factionStore.current], () => {
             </tr>
           </tbody>
         </table>
+
+        <div v-else class="p-8 text-center text-gray-500 italic">
+          No items found matching your search.
+        </div>
+
       </div>
     </div>
   </main>

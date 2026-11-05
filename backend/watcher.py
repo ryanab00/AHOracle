@@ -26,7 +26,7 @@ from backend.models import Base
 
 
 
-from config import (
+from backend.ahoracle.config import (
     load as load_config, save as save_config,
     find_sv_file, is_valid_sv_file,
 )
